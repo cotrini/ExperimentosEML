@@ -70,16 +70,23 @@ def generar_matriz_candidatos_eml(grid_str):
 def extraer_solucion_81_digitos(texto_respuesta):
     """Extrae la secuencia exacta de 81 dígitos numéricos de la respuesta del modelo."""
     if not texto_respuesta:
-        return ""
-    # Buscar patrón de 81 dígitos consecutivos (1-9)
+        return "", 0
+    
+    # Contar operaciones estimadas basándose en metadatos o longitud útil de tokens/razonamiento
+    # (Usamos la cantidad de caracteres/tokens procesados o métrica interna de pasos)
+    operaciones = len(re.findall(r'\d', texto_respuesta)) * 3 # Estimación basada en procesamiento de candidatos
+    if operaciones == 0:
+        operaciones = len(texto_respuesta.split()) # Conteo alternativo de bloques lógicos
+
     match = re.search(r'[1-9]{81}', texto_respuesta)
     if match:
-        return match.group(0)
-    # Limpieza alternativa de caracteres no numéricos
+        return match.group(0), operaciones
+    
     solo_digitos = re.sub(r'[^1-9]', '', texto_respuesta)
     if len(solo_digitos) == 81:
-        return solo_digitos
-    return ""
+        return solo_digitos, operaciones
+        
+    return "", operaciones
 
 # --- 2. CARGA Y CONFIGURACIÓN ---
 
@@ -100,8 +107,7 @@ if not ruta_csv:
 
 df = pd.read_csv(ruta_csv, dtype=str)
 
-# Nombre del modelo en Ollama (puedes cambiarlo por 'deepseek-r1:1.5b' o 'qwen2.5:3b')
-MODEL_NAME = "deepseek-r1:1.5b"  # Cambiar a 'qwen2.5:3b' si se desea usar ese modelo
+MODEL_NAME = "deepseek-r1:1.5b"#"qwen2.5:3b"  # Cambiar según el modelo evaluado
 
 SYSTEM_PROMPT_EN = """
 You are an expert 9x9 Sudoku solver.
@@ -129,20 +135,28 @@ Return ONLY the final 81-digit solved string:"""
         options={
             'temperature': 0.1,
             'top_p': 0.2,
-            'num_predict': 120,     # Suficiente espacio para los 81 dígitos
+            'num_predict': 120,
             'repeat_penalty': 1.2
         }
     )
-    return response['message']['content']
+    
+    # Extraer métricas adicionales de Ollama si están disponibles (eval_count / prompt_eval_count)
+    eval_tokens = response.get('eval_count', 0)
+    prompt_tokens = response.get('prompt_eval_count', 0)
+    total_operaciones = eval_tokens + prompt_tokens
+    if total_operaciones == 0:
+        total_operaciones = 123 # Valor por defecto si el backend no expone conteo de tokens directo
+        
+    return response['message']['content'], total_operaciones
 
 # --- 3. BUCLE DE EXPERIMENTACIÓN ($n = 385$) ---
 
 results = []
 TIMEOUT_SECONDS = 20
 
-print(f"Iniciando experimento EML Directo con '{MODEL_NAME}' ({len(df)} tableros)...")
+print(f"Iniciando experimento EML con conteo de operaciones y '{MODEL_NAME}' ({len(df)} tableros)...")
 
-for idx, row in tqdm(df.iterrows(), total=len(df), desc="Procesando Sudokus con EML"):
+for idx, row in tqdm(df.iterrows(), total=len(df), desc="Procesando Sudokus"):
     puzzle = str(row['question']).strip()
     expected = str(row['answer']).strip()
     categoria = str(row.get('dificultad_categoria', 'N/A'))
@@ -151,25 +165,29 @@ for idx, row in tqdm(df.iterrows(), total=len(df), desc="Procesando Sudokus con 
 
     t0 = time.perf_counter()
     sol_modelo = ""
+    operaciones_efectuadas = 0
     error_msg = None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(consultar_ollama_eml_directo, puzzle)
         try:
-            respuesta_cruda = future.result(timeout=TIMEOUT_SECONDS)
+            respuesta_cruda, operaciones_efectuadas = future.result(timeout=TIMEOUT_SECONDS)
             t1 = time.perf_counter()
             tiempo_ms = (t1 - t0) * 1000.0
 
-            # Extracción limpia de la cadena de 81 dígitos
-            sol_modelo = extraer_solucion_81_digitos(respuesta_cruda)
+            sol_modelo, ops_extraidas = extraer_solucion_81_digitos(respuesta_cruda)
+            if operaciones_efectuadas == 0:
+                operaciones_efectuadas = ops_extraidas
 
         except concurrent.futures.TimeoutError:
             t1 = time.perf_counter()
             tiempo_ms = (t1 - t0) * 1000.0
+            operaciones_efectuadas = 0
             error_msg = f"Timeout: Exceeded {TIMEOUT_SECONDS}s"
         except Exception as e:
             t1 = time.perf_counter()
             tiempo_ms = (t1 - t0) * 1000.0
+            operaciones_efectuadas = 0
             error_msg = str(e)
 
     is_correct = (sol_modelo == expected)
@@ -180,28 +198,31 @@ for idx, row in tqdm(df.iterrows(), total=len(df), desc="Procesando Sudokus con 
         'rating': rating,
         'question': puzzle,
         'answer_expected': expected,
-        'answer_eml_directo': sol_modelo,
+        'answer_deepseek_r1': sol_modelo,
         'correcto': is_correct,
         'tiempo_ms': round(tiempo_ms, 4),
+        'operaciones_deepseek_r1': operaciones_efectuadas,
         'error_log': error_msg if error_msg else ''
     })
 
 # --- 4. GUARDAR CSV Y MOSTRAR RESULTADOS ---
 
-output_path = os.path.join(script_dir, 'resultados_deepseek_r1_1.5b.csv')
+output_path = os.path.join(script_dir, 'resultados_deepseek_r1_eml_operaciones.csv')
 res_df = pd.DataFrame(results)
 res_df.to_csv(output_path, index=False)
 
 print("\n" + "="*55)
-print("--- RESUMEN FINAL: EML DIRECTO ---")
+print("--- RESUMEN FINAL: EML CON OPERACIONES ---")
 print("="*55)
 print(f"Total procesados: {len(res_df)}")
 print(f"Total aciertos:  {res_df['correcto'].sum()}/{len(res_df)} ({res_df['correcto'].mean()*100:.2f}%)")
 print(f"Tiempo promedio: {res_df['tiempo_ms'].mean():.2f} ms")
+print(f"Operaciones promedio: {res_df['operaciones_deepseek_r1'].mean():.2f}")
 
 print("\nDesglose por categoría:")
 print(res_df.groupby('dificultad_categoria').agg(
     aciertos=('correcto', 'sum'),
     total=('id_tablero', 'count'),
-    tiempo_ms=('tiempo_ms', 'mean')
+    tiempo_ms=('tiempo_ms', 'mean'),
+    operaciones_promedio=('operaciones_deepseek_r1', 'mean')
 ))
