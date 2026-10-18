@@ -1,0 +1,13 @@
+# Entorno virtual
+mi_entorno/
+
+# Archivos pesados y resultados
+*.csv
+/Sudokus Test/
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+
+# Claves de entorno
+.env
